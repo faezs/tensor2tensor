@@ -18,9 +18,6 @@ from __future__ import division
 from __future__ import print_function
 
 import inspect
-
-# Dependency imports
-
 import numpy as np
 import six
 
@@ -40,6 +37,7 @@ class Metrics(object):
   ACC = "accuracy"
   ACC_TOP5 = "accuracy_top5"
   ACC_PER_SEQ = "accuracy_per_sequence"
+  ACC_MULTILABEL_MATCH3 = "accuracy_multilabel_match3"
   NEG_LOG_PERPLEXITY = "neg_log_perplexity"
   APPROX_BLEU = "approx_bleu_score"
   RMSE = "rmse"
@@ -57,14 +55,37 @@ class Metrics(object):
   SIGMOID_CROSS_ENTROPY_ONE_HOT = "sigmoid_cross_entropy_one_hot"
   ROC_AUC = "roc_auc"
   IMAGE_SUMMARY = "image_summary"
+  DMOL_PERPLEXITY = "disc_mol_neg_log_perplexity"
+  ABS_ERR = "mean_absolute_error"
+  IMAGE_RMSE = "image_rmse"
+
+
+def image_rmse(predictions, labels, weights_fn=common_layers.weights_all):
+  """RMSE but will argmax if last dim is not 1."""
+  if common_layers.shape_list(predictions)[-1] == 1:
+    predictions = tf.squeeze(predictions, axis=[-1])
+  else:
+    predictions = tf.argmax(predictions, axis=-1)
+  return padded_rmse(predictions, labels, weights_fn)
 
 
 def padded_rmse(predictions, labels, weights_fn=common_layers.weights_all):
+  predictions = tf.to_float(predictions)
+  labels = tf.to_float(labels)
   predictions, labels = common_layers.pad_with_zeros(predictions, labels)
-  targets = labels
-  weights = weights_fn(targets)
-  error = tf.sqrt(tf.pow(predictions - labels, 2))
-  return tf.reduce_sum(error * weights), tf.reduce_sum(weights)
+  weights = weights_fn(labels)
+  error = tf.pow(predictions - labels, 2)
+  error_sqrt = tf.sqrt(tf.reduce_mean(error * weights))
+  return error_sqrt, tf.reduce_sum(weights)
+
+
+def abs_error(predictions, labels, weights_fn=None):
+  """Computes mean(abs(preds-target))."""
+  del weights_fn  # Unused
+  targets = tf.squeeze(labels, axis=[2, 3])
+  batch_abs_error = tf.abs(predictions - targets)
+  den = tf.ones(tf.shape(batch_abs_error), dtype=tf.float32)
+  return (batch_abs_error, den)
 
 
 def padded_log_poisson(predictions,
@@ -223,6 +244,16 @@ def padded_neg_log_perplexity(predictions,
   return (-num, den)
 
 
+def dmol_neg_log_perplexity(predictions,
+                            labels,
+                            weights_fn=None):
+  """Average log-perplexity excluding padding 0s. No smoothing."""
+  del weights_fn  # Unused
+  num, den = common_layers.dml_loss(
+      predictions, labels, reduce_sum=False)
+  return (-num, den)
+
+
 def rounding_accuracy(predictions,
                       labels,
                       weights_fn=common_layers.weights_nonzero):
@@ -248,6 +279,44 @@ def padded_accuracy(predictions,
     outputs = tf.to_int32(tf.argmax(padded_predictions, axis=-1))
     padded_labels = tf.to_int32(padded_labels)
     return tf.to_float(tf.equal(outputs, padded_labels)), weights
+
+
+def multilabel_accuracy_matchk(predictions,
+                               labels,
+                               k,
+                               weights_fn=common_layers.weights_nonzero):
+  """Used to evaluate the VQA accuracy.
+
+  Let n be the times that predictions appear in labels, then final score
+  is min(n/k, 1).
+  Refer to https://arxiv.org/pdf/1505.00468.pdf.
+
+  Args:
+    predictions: A tensor with shape [batch_size, 1, 1, 1, vocab_size].
+    labels: A tensor with shape [batch_size, length, 1, 1].
+    k: A tensor constant.
+    weights_fn: weight function.
+  Returns:
+    scores: min(n/k, 1).
+    weights: returns all ones.
+
+  """
+  predictions = tf.to_int32(tf.argmax(predictions, axis=-1))
+  scores = tf.to_float(tf.equal(predictions, labels))
+  # those label == 0 do not count
+  weights = weights_fn(labels)
+  scores *= weights
+  scores = tf.reduce_sum(scores, axis=[1, 2, 3])
+  scores = tf.minimum(scores / tf.to_float(k), 1)
+  # every sample count
+  weights = tf.ones(tf.shape(scores), dtype=tf.float32)
+
+  return scores, weights
+
+
+def multilabel_accuracy_match3(predictions, labels,
+                               weights_fn=common_layers.weights_nonzero):
+  return multilabel_accuracy_matchk(predictions, labels, 3, weights_fn)
 
 
 def set_precision(predictions, labels,
@@ -483,6 +552,20 @@ def create_evaluation_metrics(problems, model_hparams):
 
     return problem_metric_fn
 
+  def make_image_wrapped_metric_fn(metric_fn):
+    """Metric fn without tf.metrics.mean."""
+
+    def image_wrapped_metric_fn(predictions,
+                                features,
+                                labels,
+                                weights_fn=common_layers.weights_all):
+      del weights_fn
+      del features
+      predictions, labels = reduce_dimensions(predictions, labels)
+      return metric_fn(predictions, labels, model_hparams)
+
+    return image_wrapped_metric_fn
+
   eval_metrics = dict()
   for problem_instance in problems:
     problem_name = problem_instance.name
@@ -494,45 +577,23 @@ def create_evaluation_metrics(problems, model_hparams):
                                     metrics,
                                     list(METRICS_FNS.keys())))
 
-    def image_wrapped_metric_fn(predictions,
-                                features,
-                                labels,
-                                weights_fn=common_layers.weights_all):
-      del weights_fn
-      del features
-      predictions, labels = reduce_dimensions(predictions, labels)
-      return metric_fn(predictions, labels, model_hparams)
-
     tm = problem_instance.get_hparams().target_modality
-    if isinstance(tm, dict):
-      for k, v in six.iteritems(tm):
-        if isinstance(v, tuple):
-          v = registry.create_modality(v, model_hparams)
-        weights_fn = v.targets_weights_fn
+    if not isinstance(tm, dict):
+      tm = {"targets": tm}
 
-        for metric in metrics:
-          metric_fn = METRICS_FNS[metric]
-          metric_name = "metrics-%s/%s/%s" % (problem_name, k, metric)
-          if metric == Metrics.IMAGE_SUMMARY:
-            eval_metrics[metric_name] = image_wrapped_metric_fn
-          else:
-            problem_metric_fn = make_problem_specific_metric_fn(
-                metric_fn, weights_fn)
-            eval_metrics[metric_name] = problem_metric_fn
-    else:
-      if isinstance(tm, tuple):
-        tm = registry.create_modality(tm, model_hparams)
-      weights_fn = tm.targets_weights_fn
+    for target_name, modality in six.iteritems(tm):
+      if isinstance(modality, tuple):
+        modality = registry.create_modality(modality, model_hparams)
+      weights_fn = modality.targets_weights_fn
 
       for metric in metrics:
         metric_fn = METRICS_FNS[metric]
-        metric_name = "metrics-%s/%s" % (problem_name, metric)
+        metric_name = "metrics-%s/%s/%s" % (problem_name, target_name, metric)
         if metric == Metrics.IMAGE_SUMMARY:
-          eval_metrics[metric_name] = image_wrapped_metric_fn
+          eval_metrics[metric_name] = make_image_wrapped_metric_fn(metric_fn)
         else:
-          problem_metric_fn = make_problem_specific_metric_fn(
+          eval_metrics[metric_name] = make_problem_specific_metric_fn(
               metric_fn, weights_fn)
-          eval_metrics[metric_name] = problem_metric_fn
 
   return eval_metrics
 
@@ -591,6 +652,7 @@ METRICS_FNS = {
     Metrics.ACC: padded_accuracy,
     Metrics.ACC_TOP5: padded_accuracy_top5,
     Metrics.ACC_PER_SEQ: padded_sequence_accuracy,
+    Metrics.ACC_MULTILABEL_MATCH3: multilabel_accuracy_match3,
     Metrics.NEG_LOG_PERPLEXITY: padded_neg_log_perplexity,
     Metrics.APPROX_BLEU: bleu_hook.bleu_score,
     Metrics.RMSE: padded_rmse,
@@ -608,4 +670,7 @@ METRICS_FNS = {
     Metrics.SET_RECALL: set_recall,
     Metrics.ROC_AUC: roc_auc,
     Metrics.IMAGE_SUMMARY: image_summary,
+    Metrics.DMOL_PERPLEXITY: dmol_neg_log_perplexity,
+    Metrics.ABS_ERR: abs_error,
+    Metrics.IMAGE_RMSE: image_rmse,
 }
